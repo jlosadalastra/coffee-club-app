@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from datetime import date
 from sqlalchemy import func
 import pydeck as pdk
+import requests
 
 from db import (
     init_db, SessionLocal, Group, User, Shop, Review, PostcodeConfig,
@@ -12,7 +12,6 @@ from db import (
 from osm_loader import fetch_coffee_shops_by_postcodes
 
 st.set_page_config(page_title="Coffee Club Map", layout="wide")
-
 init_db()
 
 
@@ -49,13 +48,21 @@ def set_group_postcodes(session, group_id, postcodes):
     session.commit()
 
 
-def load_shops_df(session):
-    rows = session.query(Shop).filter_by(active=1).all()
+def load_shops_df(session, active_only=True):
+    q = session.query(Shop)
+    if active_only:
+        q = q.filter_by(active=1)
+    rows = q.all()
     if not rows:
-        return pd.DataFrame(columns=["id", "name", "address", "postcode", "lat", "lon"])
+        return pd.DataFrame(columns=["id", "name", "address", "postcode", "lat", "lon", "active"])
     return pd.DataFrame([{
-        "id": r.id, "name": r.name, "address": r.address, "postcode": r.postcode,
-        "lat": r.lat, "lon": r.lon
+        "id": r.id,
+        "name": r.name,
+        "address": r.address,
+        "postcode": r.postcode,
+        "lat": r.lat,
+        "lon": r.lon,
+        "active": r.active
     } for r in rows])
 
 
@@ -69,14 +76,18 @@ def load_reviews_df(session):
             User.first_name,
             User.last_name,
             Shop.name.label("shop_name"),
-            Shop.id.label("shop_id")
+            Shop.id.label("shop_id"),
+            Review.user_id.label("user_id")
         )
         .join(User, User.id == Review.user_id)
         .join(Shop, Shop.id == Review.shop_id)
     )
     rows = q.all()
     if not rows:
-        return pd.DataFrame(columns=["review_id","rating","drink_order","review_date","first_name","last_name","shop_name","shop_id"])
+        return pd.DataFrame(columns=[
+            "review_id", "rating", "drink_order", "review_date", "first_name",
+            "last_name", "shop_name", "shop_id", "reviewer", "user_id"
+        ])
     return pd.DataFrame([{
         "review_id": r.review_id,
         "rating": r.rating,
@@ -86,12 +97,12 @@ def load_reviews_df(session):
         "last_name": r.last_name,
         "reviewer": f"{r.first_name} {r.last_name}",
         "shop_name": r.shop_name,
-        "shop_id": r.shop_id
+        "shop_id": r.shop_id,
+        "user_id": r.user_id
     } for r in rows])
 
 
 def bayesian_score(df, min_reviews=3, m=5):
-    # df must have columns: shop_name, rating
     if df.empty:
         return pd.DataFrame(columns=["shop_name", "review_count", "avg_rating", "bayesian"])
     C = df["rating"].mean()
@@ -103,8 +114,11 @@ def bayesian_score(df, min_reviews=3, m=5):
     if agg.empty:
         agg["bayesian"] = []
         return agg
-    agg["bayesian"] = ((agg["review_count"]/(agg["review_count"]+m))*agg["avg_rating"] +
-                       (m/(agg["review_count"]+m))*C)
+
+    agg["bayesian"] = (
+        (agg["review_count"] / (agg["review_count"] + m)) * agg["avg_rating"]
+        + (m / (agg["review_count"] + m)) * C
+    )
     return agg.sort_values(["bayesian", "review_count"], ascending=[False, False])
 
 
@@ -137,19 +151,167 @@ def refresh_shops_from_osm(session, postcode_prefixes):
                 active=1
             ))
             added += 1
+        else:
+            exists.active = 1
+            exists.address = s.get("address")
+            exists.postcode = s.get("postcode")
     session.commit()
     return added, len(shops)
 
 
+def replace_active_shops_with_result(session, shops):
+    # make active list exactly match latest radius result
+    session.query(Shop).filter(Shop.active == 1).update({"active": 0}, synchronize_session=False)
+
+    activated_or_added = 0
+    for s in shops:
+        exists = (
+            session.query(Shop)
+            .filter(func.lower(Shop.name) == s["name"].lower())
+            .filter(func.abs(Shop.lat - s["lat"]) < 0.0001)
+            .filter(func.abs(Shop.lon - s["lon"]) < 0.0001)
+            .first()
+        )
+        if exists:
+            exists.active = 1
+            exists.address = s.get("address")
+            exists.postcode = s.get("postcode")
+            exists.source = s.get("source", exists.source)
+            activated_or_added += 1
+        else:
+            session.add(Shop(
+                name=s["name"],
+                address=s.get("address"),
+                postcode=s.get("postcode"),
+                lat=s["lat"],
+                lon=s["lon"],
+                source=s.get("source", "osm_radius"),
+                active=1
+            ))
+            activated_or_added += 1
+
+    session.commit()
+    return activated_or_added
+
+
+# ---- optional radius mode helpers ----
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+
+def geocode_text(query_text: str):
+    params = {"q": query_text, "format": "json", "limit": 1}
+    headers = {"User-Agent": "coffee-club-app/1.4"}
+    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    return float(data[0]["lat"]), float(data[0]["lon"])
+
+
+def fetch_cafes_by_radius(lat, lon, radius_km=2.0):
+    radius_m = int(radius_km * 1000)
+    query = f"""
+    [out:json][timeout:60];
+    (
+      node["amenity"="cafe"](around:{radius_m},{lat},{lon});
+      way["amenity"="cafe"](around:{radius_m},{lat},{lon});
+      relation["amenity"="cafe"](around:{radius_m},{lat},{lon});
+    );
+    out center tags;
+    """
+    r = requests.get(OVERPASS_URL, params={"data": query}, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+
+    shops = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        name = tags.get("name")
+        if not name:
+            continue
+
+        if el.get("type") == "node":
+            slat, slon = el.get("lat"), el.get("lon")
+        else:
+            c = el.get("center", {})
+            slat, slon = c.get("lat"), c.get("lon")
+
+        if slat is None or slon is None:
+            continue
+
+        postcode = tags.get("addr:postcode", None)
+        address_parts = [
+            tags.get("addr:housenumber", ""),
+            tags.get("addr:street", ""),
+            tags.get("addr:city", ""),
+            tags.get("addr:postcode", "")
+        ]
+        address = " ".join([a for a in address_parts if a]).strip()
+
+        shops.append({
+            "name": name,
+            "address": address if address else None,
+            "postcode": postcode,
+            "lat": float(slat),
+            "lon": float(slon),
+            "source": "osm_radius"
+        })
+
+    seen = set()
+    deduped = []
+    for s in shops:
+        key = (s["name"].lower(), round(s["lat"], 5), round(s["lon"], 5))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(s)
+    return deduped
+
+
+def render_star_text(x):
+    return f"⭐ {round(float(x), 1):.1f}"
+
+
+def extract_street(address: str):
+    if not address or not str(address).strip():
+        return "Unknown street"
+    cleaned = " ".join(str(address).split())
+    return cleaned
+
+
+def shop_label(row):
+    street = extract_street(row.get("address"))
+    return f"{row.get('name', 'Unknown cafe')}, {street}"
+
+
+def add_last_visit_for_user(session, shops_df, user_id):
+    if shops_df.empty:
+        shops_df["Last visit"] = pd.NaT
+        return shops_df
+
+    user_last_visits = (
+        session.query(
+            Review.shop_id.label("shop_id"),
+            func.max(Review.review_date).label("last_visit")
+        )
+        .filter(Review.user_id == user_id)
+        .group_by(Review.shop_id)
+        .all()
+    )
+    last_visit_map = {row.shop_id: row.last_visit for row in user_last_visits}
+    out = shops_df.copy()
+    out["Last visit"] = out["id"].map(last_visit_map)
+    return out
+
+
 # ---------- UI ----------
 st.title("☕ Coffee Club Map & Reviews")
-
 session = SessionLocal()
 
 # -------- Auth / Group onboarding --------
 if "user_id" not in st.session_state:
     st.subheader("Join or Create a Group")
-
     tab1, tab2 = st.tabs(["Join Group", "Create Group (Admin)"])
 
     with tab1:
@@ -183,16 +345,13 @@ if "user_id" not in st.session_state:
                     st.error("Join code already exists. Choose another.")
                 else:
                     u, _ = get_or_create_user(session, g.id, admin_first, admin_last, role="admin")
-                    # default postcodes
                     for p in ["OX1", "OX2", "OX3", "OX4"]:
                         session.add(PostcodeConfig(group_id=g.id, postcode_prefix=p))
                     session.commit()
-
                     st.session_state["user_id"] = u.id
                     st.session_state["group_id"] = g.id
                     st.success(f"Group created. Share code: {g.join_code}")
                     st.rerun()
-
     st.stop()
 
 current_user = get_current_user(session)
@@ -211,19 +370,38 @@ if st.button("Logout"):
 with st.sidebar:
     st.header("Controls")
 
-    # Editable postcodes
-    postcodes = get_group_postcodes(session, current_group.id)
-    postcodes_txt = st.text_input("Postcode prefixes (comma-separated)", value=", ".join(postcodes))
-    if st.button("Save postcodes"):
-        pcs = [p.strip().upper() for p in postcodes_txt.split(",") if p.strip()]
-        set_group_postcodes(session, current_group.id, pcs)
-        st.success("Postcodes updated.")
+    fetch_mode = st.radio("Shop fetch mode", ["Postcode prefixes", "Base location + radius (km)"], index=0)
 
-    if st.button("Refresh shops from OSM"):
-        pcs = get_group_postcodes(session, current_group.id)
-        with st.spinner("Fetching coffee shops from OpenStreetMap..."):
-            added, found = refresh_shops_from_osm(session, pcs)
-        st.success(f"Found {found} shops, added {added} new.")
+    if fetch_mode == "Postcode prefixes":
+        postcodes = get_group_postcodes(session, current_group.id)
+        postcodes_txt = st.text_input("Postcode prefixes (comma-separated)", value=", ".join(postcodes))
+        if st.button("Save postcodes"):
+            pcs = [p.strip().upper() for p in postcodes_txt.split(",") if p.strip()]
+            set_group_postcodes(session, current_group.id, pcs)
+            st.success("Postcodes updated.")
+
+        if st.button("Refresh shops from OSM (postcodes)"):
+            pcs = get_group_postcodes(session, current_group.id)
+            with st.spinner("Fetching coffee shops from OpenStreetMap..."):
+                added, found = refresh_shops_from_osm(session, pcs)
+            st.success(f"Found {found} shops, added {added} new.")
+    else:
+        postcode_text = st.text_input("Postcode", value="OX2 6AT")
+        radius_km = st.number_input("Radius (km)", min_value=0.3, max_value=20.0, value=2.0, step=0.1)
+        if st.button("Refresh shops from OSM (radius)"):
+            try:
+                with st.spinner("Geocoding postcode..."):
+                    geo = geocode_text(postcode_text)
+                if not geo:
+                    st.error("Could not geocode that postcode.")
+                else:
+                    lat, lon = geo
+                    with st.spinner("Fetching cafes by radius..."):
+                        shops = fetch_cafes_by_radius(lat, lon, radius_km=radius_km)
+                        count_active = replace_active_shops_with_result(session, shops)
+                    st.success(f"Found {len(shops)} shops. Active list replaced with {count_active} cafes.")
+            except Exception as e:
+                st.error(f"Error while fetching shops: {e}")
 
     st.markdown("---")
     st.subheader("Leaderboard settings")
@@ -231,22 +409,28 @@ with st.sidebar:
     bayes_m = st.number_input("Bayesian m (confidence)", min_value=1, max_value=50, value=5, step=1)
 
 # -------- Main tabs --------
-tab_map, tab_review, tab_leaderboard, tab_data = st.tabs(["Map", "Submit Review", "Leaderboards", "Data"])
+tabs = ["Map", "Submit Review", "Leaderboards", "Data"]
+if current_user.role == "admin":
+    tabs.append("Admin")
+
+tab_objs = st.tabs(tabs)
+tab_map, tab_review, tab_leaderboard, tab_data = tab_objs[:4]
+tab_admin = tab_objs[4] if current_user.role == "admin" else None
 
 # Map tab
 with tab_map:
     st.subheader("Coffee shops map")
-    shops_df = load_shops_df(session)
+    shops_df = load_shops_df(session, active_only=True)
 
     reviewed_only = st.checkbox("Show reviewed shops only", value=False)
-
     reviews_df = load_reviews_df(session)
+
     if reviewed_only and not reviews_df.empty:
         reviewed_shop_ids = reviews_df["shop_id"].unique().tolist()
         shops_df = shops_df[shops_df["id"].isin(reviewed_shop_ids)]
 
     if shops_df.empty:
-        st.info("No shops loaded yet. Use sidebar: 'Refresh shops from OSM'.")
+        st.info("No shops loaded yet. Use sidebar fetch.")
     else:
         mid_lat = shops_df["lat"].mean()
         mid_lon = shops_df["lon"].mean()
@@ -259,26 +443,51 @@ with tab_map:
             get_fill_color='[30, 136, 229, 180]',
             pickable=True,
         )
-
         view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=12, pitch=0)
         tooltip = {"text": "{name}\n{address}\n{postcode}"}
-
         st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip), use_container_width=True)
-        st.dataframe(shops_df[["name", "address", "postcode"]], use_container_width=True, hide_index=True)
+
+        display_df = shops_df.copy()
+        display_df["Cafe"] = display_df.apply(shop_label, axis=1)
+        display_df = add_last_visit_for_user(session, display_df, current_user.id)
+
+        st.dataframe(
+            display_df[["Cafe", "postcode", "Last visit"]].rename(columns={"postcode": "Postcode"}),
+            use_container_width=True,
+            hide_index=True
+        )
 
 # Review tab
 with tab_review:
     st.subheader("Submit a review")
-    shops_df = load_shops_df(session)
+    shops_df = load_shops_df(session, active_only=True)
 
     if shops_df.empty:
-        st.info("No shops available. Refresh shops from OSM first.")
+        st.info("No shops available. Refresh shops first.")
     else:
-        shop_options = {f"{r['name']} ({r['postcode'] or 'N/A'})": r["id"] for _, r in shops_df.iterrows()}
+        shop_options = {shop_label(r): r["id"] for _, r in shops_df.iterrows()}
         selected_label = st.selectbox("Select shop", list(shop_options.keys()))
         shop_id = shop_options[selected_label]
 
-        rating = st.slider("Rating (1-5)", min_value=1, max_value=5, value=4)
+        st.write("Your rating")
+        if "selected_rating" not in st.session_state:
+            st.session_state["selected_rating"] = 4
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        if c1.button("⭐", key="rate1"):
+            st.session_state["selected_rating"] = 1
+        if c2.button("⭐⭐", key="rate2"):
+            st.session_state["selected_rating"] = 2
+        if c3.button("⭐⭐⭐", key="rate3"):
+            st.session_state["selected_rating"] = 3
+        if c4.button("⭐⭐⭐⭐", key="rate4"):
+            st.session_state["selected_rating"] = 4
+        if c5.button("⭐⭐⭐⭐⭐", key="rate5"):
+            st.session_state["selected_rating"] = 5
+
+        rating = st.session_state["selected_rating"]
+        st.write(f"Selected: **{render_star_text(rating)}**")
+
         drink_order = st.text_input("Drink order", placeholder="e.g. Flat White, Oat Latte")
         today = date.today()
         st.write(f"Review date: **{today}**")
@@ -330,9 +539,20 @@ with tab_leaderboard:
             if lb.empty:
                 st.warning("No shops meet minimum review threshold.")
             else:
-                lb["avg_rating"] = lb["avg_rating"].round(2)
-                lb["bayesian"] = lb["bayesian"].round(3)
-                st.dataframe(lb, use_container_width=True, hide_index=True)
+                lb["Average rating"] = lb["avg_rating"].round(1).apply(render_star_text)
+                lb["Complex average"] = lb["bayesian"].round(1).apply(render_star_text)
+
+                out = lb.rename(columns={"shop_name": "Coffee shop", "review_count": "Reviews"})[
+                    ["Coffee shop", "Reviews", "Average rating", "Complex average"]
+                ]
+                st.dataframe(out, use_container_width=True, hide_index=True)
+
+                st.info(
+                    "Complex average (?) = Bayesian average.\n\n"
+                    "It combines a cafe's own average with the global average so places with very few "
+                    "reviews don't jump unfairly to the top.\n\n"
+                    "As a cafe gets more reviews, its own rating has more influence."
+                )
         else:
             td = top_drinkers(df_filtered)
             st.dataframe(td, use_container_width=True, hide_index=True)
@@ -341,7 +561,7 @@ with tab_leaderboard:
 with tab_data:
     st.subheader("Export data")
     reviews_df = load_reviews_df(session)
-    shops_df = load_shops_df(session)
+    shops_df = load_shops_df(session, active_only=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -356,10 +576,118 @@ with tab_data:
 
     with c2:
         st.write("Shops")
-        st.dataframe(shops_df, use_container_width=True, hide_index=True)
+        display_df = shops_df.copy()
+        display_df["Cafe"] = display_df.apply(shop_label, axis=1)
+        display_df = add_last_visit_for_user(session, display_df, current_user.id)
+
+        st.dataframe(
+            display_df[["Cafe", "postcode", "lat", "lon", "Last visit"]].rename(columns={"postcode": "Postcode"}),
+            use_container_width=True,
+            hide_index=True
+        )
         st.download_button(
             "Download shops CSV",
             data=shops_df.to_csv(index=False).encode("utf-8"),
             file_name="shops.csv",
             mime="text/csv"
         )
+
+# Admin tab
+if tab_admin is not None:
+    with tab_admin:
+        st.subheader("Admin: Manage cafes")
+
+        shops_all_df = load_shops_df(session, active_only=False)
+        if shops_all_df.empty:
+            st.info("No cafes found in database.")
+        else:
+            active_df = shops_all_df[shops_all_df["active"] == 1].copy()
+            inactive_df = shops_all_df[shops_all_df["active"] == 0].copy()
+
+            st.markdown("### Deactivate one cafe")
+            if active_df.empty:
+                st.info("No active cafes to deactivate.")
+            else:
+                options = {f"{shop_label(r)} [ID:{int(r['id'])}]": int(r["id"]) for _, r in active_df.iterrows()}
+                target_label = st.selectbox("Select cafe", list(options.keys()), key="admin_single_shop")
+                if st.button("Deactivate selected cafe"):
+                    sid = options[target_label]
+                    shop = session.query(Shop).filter_by(id=sid).first()
+                    if shop:
+                        shop.active = 0
+                        session.commit()
+                        st.success(f"Deactivated: {shop.name}")
+                        st.rerun()
+
+            st.markdown("---")
+            st.markdown("### Deactivate by chain keyword")
+            chain_kw = st.text_input("Chain keyword", placeholder="e.g. costa, nero, starbucks")
+
+            if st.button("Preview chain matches"):
+                if chain_kw.strip():
+                    q = chain_kw.strip().lower()
+                    matches = active_df[active_df["name"].str.lower().str.contains(q, na=False)].copy()
+                    matches["Cafe"] = matches.apply(shop_label, axis=1)
+                    st.write(f"Matches: {len(matches)}")
+                    st.dataframe(matches[["id", "Cafe", "postcode"]], use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Enter a keyword first.")
+
+            if st.button("Deactivate all matches for keyword"):
+                if not chain_kw.strip():
+                    st.warning("Enter a keyword first.")
+                else:
+                    q = chain_kw.strip().lower()
+                    to_deactivate = session.query(Shop).filter(
+                        Shop.active == 1,
+                        func.lower(Shop.name).contains(q)
+                    ).all()
+                    for s in to_deactivate:
+                        s.active = 0
+                    session.commit()
+                    st.success(f"Deactivated {len(to_deactivate)} cafes matching '{chain_kw.strip()}'.")
+                    st.rerun()
+
+            st.markdown("---")
+            st.markdown("### Restore deactivated cafes")
+            if inactive_df.empty:
+                st.info("No deactivated cafes to restore.")
+            else:
+                restore_options = {f"{shop_label(r)} [ID:{int(r['id'])}]": int(r["id"]) for _, r in inactive_df.iterrows()}
+                restore_label = st.selectbox("Select cafe to restore", list(restore_options.keys()), key="restore_single_shop")
+                if st.button("Restore selected cafe"):
+                    sid = restore_options[restore_label]
+                    shop = session.query(Shop).filter_by(id=sid).first()
+                    if shop:
+                        shop.active = 1
+                        session.commit()
+                        st.success(f"Restored: {shop.name}")
+                        st.rerun()
+
+                st.markdown("#### Restore by chain keyword")
+                restore_kw = st.text_input("Restore keyword", placeholder="e.g. costa, nero", key="restore_kw")
+
+                if st.button("Preview restore matches"):
+                    if restore_kw.strip():
+                        q = restore_kw.strip().lower()
+                        matches = inactive_df[inactive_df["name"].str.lower().str.contains(q, na=False)].copy()
+                        matches["Cafe"] = matches.apply(shop_label, axis=1)
+                        st.write(f"Matches: {len(matches)}")
+                        st.dataframe(matches[["id", "Cafe", "postcode"]], use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("Enter a keyword first.")
+
+                if st.button("Restore all matches for keyword"):
+                    if not restore_kw.strip():
+                        st.warning("Enter a keyword first.")
+                    else:
+                        q = restore_kw.strip().lower()
+                        to_restore = session.query(Shop).filter(
+                            Shop.active == 0,
+                            func.lower(Shop.name).contains(q)
+                        ).all()
+                        for s in to_restore:
+                            s.active = 1
+                        session.commit()
+                        st.success(f"Restored {len(to_restore)} cafes matching '{restore_kw.strip()}'.")
+                        st.rerun()
