@@ -403,10 +403,10 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Error while fetching shops: {e}")
 
-    st.markdown("---")
-    st.subheader("Leaderboard settings")
-    min_reviews = st.number_input("Minimum reviews per shop", min_value=1, max_value=20, value=3, step=1)
-    bayes_m = st.number_input("Bayesian m (confidence)", min_value=1, max_value=50, value=5, step=1)
+    #st.markdown("---")
+    #st.subheader("Leaderboard settings")
+    min_reviews = 1 #st.number_input("Minimum reviews per shop", min_value=1, max_value=20, value=3, step=1)
+    #bayes_m = st.number_input("Bayesian m (confidence)", min_value=1, max_value=50, value=5, step=1)
 
 # -------- Main tabs --------
 tabs = ["Map", "Submit Review", "Leaderboards", "Data"]
@@ -450,7 +450,7 @@ with tab_map:
         plot_df["g"] = 136
         plot_df["b"] = 229
         plot_df["a"] = 170
-        #plot_df["label"] = plot_df["name"].astype(str)
+        plot_df["label"] = plot_df["name"].astype(str)
 
         # Default center
         center_lat = plot_df["lat"].mean()
@@ -501,7 +501,7 @@ with tab_map:
             pdk.Deck(
                 map_style="mapbox://styles/mapbox/light-v10",
                 initial_view_state=view_state,
-                layers=[scatter, text],
+                layers=[scatter],
                 tooltip=tooltip
             ),
             use_container_width=True
@@ -578,7 +578,7 @@ with tab_review:
             drink_order = other_drink.strip() if other_drink.strip() else "Other"
         else:
             drink_order = drink_choice
-            
+
         today = date.today()
         st.write(f"Review date: **{today}**")
 
@@ -635,17 +635,24 @@ with tab_leaderboard:
                         AverageRatingNum=("rating", "mean")
                     )
                 )
-                lb = lb[lb["Reviews"] >= min_reviews].copy()
+
+                # Optional min reviews disabled for now
+                # lb = lb[lb["Reviews"] >= min_reviews].copy()
 
                 if lb.empty:
-                    st.warning("No shops meet minimum review threshold.")
+                    st.warning("No shops to rank yet.")
                 else:
                     lb["Average rating"] = lb["AverageRatingNum"].round(1).apply(render_star_text)
+
+                    # Sort while numeric column exists
+                    lb = lb.sort_values(["AverageRatingNum", "Reviews"], ascending=[False, False])
+
+                    # Final display table (no AverageRatingNum shown)
                     out = lb.rename(columns={"shop_name": "Coffee shop"})[
                         ["Coffee shop", "Reviews", "Average rating"]
-                    ].sort_values(["AverageRatingNum", "Reviews"], ascending=[False, False])
+                    ]
 
-                    st.dataframe(out.drop(columns=["AverageRatingNum"]), use_container_width=True, hide_index=True)
+                    st.dataframe(out, use_container_width=True, hide_index=True)
         else:
             td = top_drinkers(df_filtered)
             st.dataframe(td, use_container_width=True, hide_index=True)
@@ -783,4 +790,48 @@ if tab_admin is not None:
                             s.active = 1
                         session.commit()
                         st.success(f"Restored {len(to_restore)} cafes matching '{restore_kw.strip()}'.")
+                        st.rerun()
+                        
+            st.markdown("---")
+            st.subheader("Admin: Manage reviews")
+
+            reviews_admin_df = load_reviews_df(session)
+
+            if reviews_admin_df.empty:
+                st.info("No reviews available.")
+            else:
+                # nicer label for picking a single review
+                reviews_admin_df = reviews_admin_df.copy()
+                reviews_admin_df["review_label"] = reviews_admin_df.apply(
+                    lambda r: f"[{r['review_id']}] {r['reviewer']} | {r['shop_name']} | {r['rating']}⭐ | {r['drink_order'] or '-'} | {r['review_date']}",
+                    axis=1
+                )
+
+                st.markdown("### Delete a single review")
+                review_options = {
+                    lbl: rid for lbl, rid in zip(reviews_admin_df["review_label"], reviews_admin_df["review_id"])
+                }
+                selected_review_label = st.selectbox("Select review", list(review_options.keys()), key="admin_single_review")
+
+                if st.button("Delete selected review"):
+                    rid = review_options[selected_review_label]
+                    target = session.query(Review).filter_by(id=rid).first()
+                    if target:
+                        session.delete(target)
+                        session.commit()
+                        st.success(f"Deleted review ID {rid}.")
+                        st.rerun()
+
+                st.markdown("---")
+                st.markdown("### Delete ALL reviews (danger zone)")
+                st.warning("This will permanently remove all review history.")
+
+                confirm_all = st.checkbox("I understand this cannot be undone", key="confirm_delete_all_reviews")
+                if st.button("Delete ALL reviews"):
+                    if not confirm_all:
+                        st.error("Please confirm first.")
+                    else:
+                        deleted_count = session.query(Review).delete()
+                        session.commit()
+                        st.success(f"Deleted {deleted_count} reviews.")
                         st.rerun()
