@@ -445,7 +445,7 @@ with tab_map:
 
         # make pydeck-safe primitives only
         plot_df["Last visit"] = plot_df["Last visit"].astype(str).replace("NaT", "")
-        plot_df["radius"] = 10
+        plot_df["radius"] = 15
         plot_df["r"] = 30
         plot_df["g"] = 136
         plot_df["b"] = 229
