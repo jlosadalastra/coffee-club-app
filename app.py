@@ -432,24 +432,80 @@ with tab_map:
     if shops_df.empty:
         st.info("No shops loaded yet. Use sidebar fetch.")
     else:
-        mid_lat = shops_df["lat"].mean()
-        mid_lon = shops_df["lon"].mean()
-
-        layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=shops_df,
-            get_position='[lon, lat]',
-            get_radius=60,
-            get_fill_color='[30, 136, 229, 180]',
-            pickable=True,
-        )
-        view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=12, pitch=0)
-        tooltip = {"text": "{name}\n{address}\n{postcode}"}
-        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip), use_container_width=True)
-
         display_df = shops_df.copy()
         display_df["Cafe"] = display_df.apply(shop_label, axis=1)
         display_df = add_last_visit_for_user(session, display_df, current_user.id)
+
+        # Focus/Highlight control
+        cafe_options = ["(None)"] + display_df["Cafe"].tolist()
+        selected_cafe = st.selectbox("Focus cafe on map", cafe_options)
+
+        # Map styling columns
+        plot_df = display_df.copy()
+
+        # make pydeck-safe primitives only
+        plot_df["Last visit"] = plot_df["Last visit"].astype(str).replace("NaT", "")
+        plot_df["radius"] = 10
+        plot_df["r"] = 30
+        plot_df["g"] = 136
+        plot_df["b"] = 229
+        plot_df["a"] = 170
+        #plot_df["label"] = plot_df["name"].astype(str)
+
+        # Default center
+        center_lat = plot_df["lat"].mean()
+        center_lon = plot_df["lon"].mean()
+        zoom_level = 13
+
+        if selected_cafe != "(None)":
+            sel_row = plot_df[plot_df["Cafe"] == selected_cafe].iloc[0]
+            center_lat = float(sel_row["lat"])
+            center_lon = float(sel_row["lon"])
+            zoom_level = 15
+
+            idx = plot_df["Cafe"] == selected_cafe
+            plot_df.loc[idx, "radius"] = 160
+            plot_df.loc[idx, ["r", "g", "b", "a"]] = [220, 20, 60, 230]
+
+        scatter = pdk.Layer(
+            "ScatterplotLayer",
+            data=plot_df,
+            get_position='[lon, lat]',
+            get_radius='radius',
+            get_fill_color='[r, g, b, a]',
+            pickable=True
+        )
+
+        text = pdk.Layer(
+            "TextLayer",
+            data=plot_df,
+            get_position='[lon, lat]',
+            get_text='label',
+            get_size=12,
+            get_color='[40, 40, 40, 220]',
+            get_pixel_offset='[8, -2]'
+        )
+
+        view_state = pdk.ViewState(
+            latitude=float(center_lat),
+            longitude=float(center_lon),
+            zoom=zoom_level,
+            pitch=0
+        )
+
+        tooltip = {
+            "text": "{name}\n{address}\n{postcode}\nLast visit: {Last visit}"
+        }
+
+        st.pydeck_chart(
+            pdk.Deck(
+                map_style="mapbox://styles/mapbox/light-v10",
+                initial_view_state=view_state,
+                layers=[scatter, text],
+                tooltip=tooltip
+            ),
+            use_container_width=True
+        )
 
         st.dataframe(
             display_df[["Cafe", "postcode", "Last visit"]].rename(columns={"postcode": "Postcode"}),
