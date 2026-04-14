@@ -544,7 +544,40 @@ with tab_review:
         rating = st.session_state["selected_rating"]
         st.write(f"Selected: **{render_star_text(rating)}**")
 
-        drink_order = st.text_input("Drink order", placeholder="e.g. Flat White, Oat Latte")
+        # Base drinks
+        base_drinks = [
+            "Latte",
+            "Cappuccino",
+            "Flat White",
+            "Americano",
+            "Espresso",
+            "Mocha",
+            "Cortado/Macchiato",
+            "Filter Coffee",
+            "Chai Latte",
+        ]
+
+        # Prefix modifiers
+        is_decaf = st.checkbox("Decaf")
+        is_iced = st.checkbox("Iced")
+
+        # Build prefixed options dynamically
+        prefixed_options = []
+        for d in base_drinks:
+            label = d
+            if is_decaf:
+                label = f"Decaf {label}"
+            if is_iced:
+                label = f"Iced {label}"
+            prefixed_options.append(label)
+
+        drink_choice = st.selectbox("Drink order", prefixed_options + ["Other"])
+
+        if drink_choice == "Other":
+            other_drink = st.text_input("Type your drink")
+            drink_order = other_drink.strip() if other_drink.strip() else "Other"
+        else:
+            drink_order = drink_choice
         today = date.today()
         st.write(f"Review date: **{today}**")
 
@@ -587,28 +620,31 @@ with tab_leaderboard:
 
         leaderboard_type = st.selectbox(
             "Leaderboard type",
-            ["Best coffee shops (Bayesian)", "Top coffee drinkers"]
+            ["Best coffee shops", "Top coffee drinkers"]
         )
 
-        if leaderboard_type == "Best coffee shops (Bayesian)":
-            lb = bayesian_score(df_filtered[["shop_name", "rating"]], min_reviews=min_reviews, m=bayes_m)
-            if lb.empty:
-                st.warning("No shops meet minimum review threshold.")
+        if leaderboard_type == "Best coffee shops":
+            if df_filtered.empty:
+                st.warning("No reviews available.")
             else:
-                lb["Average rating"] = lb["avg_rating"].round(1).apply(render_star_text)
-                lb["Complex average"] = lb["bayesian"].round(1).apply(render_star_text)
-
-                out = lb.rename(columns={"shop_name": "Coffee shop", "review_count": "Reviews"})[
-                    ["Coffee shop", "Reviews", "Average rating", "Complex average"]
-                ]
-                st.dataframe(out, use_container_width=True, hide_index=True)
-
-                st.info(
-                    "Complex average (?) = Bayesian average.\n\n"
-                    "It combines a cafe's own average with the global average so places with very few "
-                    "reviews don't jump unfairly to the top.\n\n"
-                    "As a cafe gets more reviews, its own rating has more influence."
+                lb = (
+                    df_filtered.groupby("shop_name", as_index=False)
+                    .agg(
+                        Reviews=("rating", "count"),
+                        AverageRatingNum=("rating", "mean")
+                    )
                 )
+                lb = lb[lb["Reviews"] >= min_reviews].copy()
+
+                if lb.empty:
+                    st.warning("No shops meet minimum review threshold.")
+                else:
+                    lb["Average rating"] = lb["AverageRatingNum"].round(1).apply(render_star_text)
+                    out = lb.rename(columns={"shop_name": "Coffee shop"})[
+                        ["Coffee shop", "Reviews", "Average rating"]
+                    ].sort_values(["AverageRatingNum", "Reviews"], ascending=[False, False])
+
+                    st.dataframe(out.drop(columns=["AverageRatingNum"]), use_container_width=True, hide_index=True)
         else:
             td = top_drinkers(df_filtered)
             st.dataframe(td, use_container_width=True, hide_index=True)
