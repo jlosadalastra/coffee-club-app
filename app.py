@@ -578,6 +578,7 @@ with tab_review:
             drink_order = other_drink.strip() if other_drink.strip() else "Other"
         else:
             drink_order = drink_choice
+            
         today = date.today()
         st.write(f"Review date: **{today}**")
 
