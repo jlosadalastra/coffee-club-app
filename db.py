@@ -43,6 +43,7 @@ class User(Base):
 class Shop(Base):
     __tablename__ = "shops"
     id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False)
     name = Column(String(180), nullable=False)
     address = Column(Text, nullable=True)
     postcode = Column(String(20), nullable=True)
@@ -57,6 +58,7 @@ class Shop(Base):
 class Review(Base):
     __tablename__ = "reviews"
     id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     shop_id = Column(Integer, ForeignKey("shops.id"), nullable=False)
     rating = Column(Integer, nullable=False)  # 1..5
@@ -68,7 +70,7 @@ class Review(Base):
     shop = relationship("Shop", back_populates="reviews")
 
     __table_args__ = (
-        UniqueConstraint("user_id", "shop_id", "review_date", name="uq_one_review_per_shop_per_day"),
+        UniqueConstraint("group_id", "user_id", "shop_id", "review_date", name="uq_one_review_per_shop_per_day_group"),
     )
 
 
